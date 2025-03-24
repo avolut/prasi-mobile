@@ -1,4 +1,4 @@
-import { readdir, mkdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import type { FileChange, DirectoryChange, RenameChanges } from "./types";
 
 /**
@@ -70,15 +70,26 @@ export async function generateChanges(
     newContent: newSettingsContent
   });
 
-  // Handle package directory changes
-  const oldPackagePath = `android/app/src/main/kotlin/${oldPackage.replace(/\./g, "/")}`;
-  const newPackagePath = `android/app/src/main/kotlin/${newPackage.replace(/\./g, "/")}`;
+  // Only copy MainActivity.kt to new package location
+  const oldPath = `android/app/src/main/kotlin/${oldPackage.replace(/\./g, "/")}/MainActivity.kt`;
+  const newPath = `android/app/src/main/kotlin/${newPackage.replace(/\./g, "/")}/MainActivity.kt`;
 
-  changes.directoryChanges.push({
-    oldPath: oldPackagePath,
-    newPath: newPackagePath,
-    type: "move"
+  // Read MainActivity content
+  const mainActivityContent = await readFile(oldPath, 'utf-8');
+  
+  // Update only the package declaration in MainActivity
+  const newMainActivityContent = mainActivityContent.replace(
+    /package\s+[\w.]+/,
+    `package ${newPackage}`
+  );
+
+  changes.fileChanges.push({
+    path: newPath,
+    oldContent: '',  // New file
+    newContent: newMainActivityContent
   });
+
+  // Don't create a directory change since we're not moving everything
 
   return changes;
 }
@@ -87,52 +98,18 @@ export async function generateChanges(
  * Applies the changes to the file system
  */
 export async function applyChanges(changes: RenameChanges): Promise<void> {
-  // First apply file changes
+  // Apply file changes
   for (const change of changes.fileChanges) {
     try {
+      // Create parent directory if needed
+      const dir = change.path.substring(0, change.path.lastIndexOf("/"));
+      await mkdir(dir, { recursive: true });
+
+      // Write file content
       await writeFile(change.path, change.newContent, 'utf-8');
     } catch (err) {
       const error = err as Error;
       throw new Error(`Failed to modify file ${change.path}: ${error.message}`);
-    }
-  }
-
-  // Then handle directory changes
-  for (const change of changes.directoryChanges) {
-    try {
-      if (change.type === "move") {
-        // Create target directory structure
-        const dir = change.newPath.substring(0, change.newPath.lastIndexOf("/"));
-        await mkdir(dir, { recursive: true });
-        await writeFile(`${dir}/.gitkeep`, "");
-
-        // Recursive function to copy directory contents
-        const copyDir = async (src: string, dest: string) => {
-          const entries = await readdir(src, { withFileTypes: true });
-          
-          for (const entry of entries) {
-            const srcPath = `${src}/${entry.name}`;
-            const destPath = `${dest}/${entry.name}`;
-            
-            if (entry.isDirectory()) {
-              await mkdir(destPath, { recursive: true });
-              await copyDir(srcPath, destPath);
-            } else if (entry.isFile() && entry.name !== '.gitkeep') {
-              const content = await readFile(srcPath, 'utf-8');
-              await writeFile(destPath, content, 'utf-8');
-            }
-          }
-        };
-
-        // Move files and directories from old to new location
-        await mkdir(change.newPath, { recursive: true });
-        await copyDir(change.oldPath, change.newPath);
-      }
-    } catch (err) {
-      const error = err as Error;
-      throw new Error(
-        `Failed to handle directory change ${change.oldPath} -> ${change.newPath}: ${error.message}`
-      );
     }
   }
 }
@@ -141,7 +118,7 @@ export async function applyChanges(changes: RenameChanges): Promise<void> {
  * Verifies that changes were applied correctly
  */
 export async function verifyChanges(changes: RenameChanges): Promise<boolean> {
-  // Verify file changes
+  // Only verify file changes
   for (const change of changes.fileChanges) {
     try {
       const content = await readFile(change.path, 'utf-8');
@@ -152,51 +129,5 @@ export async function verifyChanges(changes: RenameChanges): Promise<boolean> {
       return false;
     }
   }
-
-  // Verify directory changes
-  for (const change of changes.directoryChanges) {
-    try {
-      if (change.type === "move") {
-        // Recursive function to compare directories
-        const compareDirectories = async (src: string, dest: string): Promise<boolean> => {
-          try {
-            const srcEntries = await readdir(src, { withFileTypes: true });
-            const destEntries = await readdir(dest, { withFileTypes: true });
-
-            // Check if all source files exist in destination
-            for (const srcEntry of srcEntries) {
-              if (srcEntry.name === '.gitkeep') continue;
-              
-              const destEntry = destEntries.find(e => e.name === srcEntry.name);
-              if (!destEntry) return false;
-
-              const srcPath = `${src}/${srcEntry.name}`;
-              const destPath = `${dest}/${srcEntry.name}`;
-
-              if (srcEntry.isDirectory()) {
-                if (!destEntry.isDirectory()) return false;
-                if (!await compareDirectories(srcPath, destPath)) return false;
-              } else if (srcEntry.isFile()) {
-                if (!destEntry.isFile()) return false;
-                const srcContent = await readFile(srcPath, 'utf-8');
-                const destContent = await readFile(destPath, 'utf-8');
-                if (srcContent !== destContent) return false;
-              }
-            }
-            return true;
-          } catch {
-            return false;
-          }
-        };
-
-        if (!await compareDirectories(change.oldPath, change.newPath)) {
-          return false;
-        }
-      }
-    } catch {
-      return false;
-    }
-  }
-
   return true;
 }
