@@ -34,15 +34,16 @@ import kotlin.concurrent.thread
 fun App() {
     MaterialTheme {
         val context = LocalContext.current
-        val proxyServer = remember(context) { ProxyServer(context) }
-        var proxyBaseUrl by remember { mutableStateOf("") }
-        val initialUrl by remember { mutableStateOf("https://github.com/") }
+        var proxyBaseUrl by remember { mutableStateOf("https://prasi.avolut.com") }
+        val proxyPathname by remember { mutableStateOf("prod/bf706e40-2a3a-4148-9cdd-75d4483328d7/moka/coba") }
+        val proxyServer = remember(context) { ProxyServer(context, proxyBaseUrl, proxyPathname) }
         var isProxyReady by remember { mutableStateOf(false) }
 
         // Initialize proxy server in background thread
         DisposableEffect(Unit) {
             thread {
                 try {
+                    proxyServer.setBaseUrl(proxyBaseUrl)
                     proxyServer.start()
                     // Update UI on main thread
                     (context as? Activity)?.runOnUiThread {
@@ -66,11 +67,13 @@ fun App() {
         }
 
         // Use proxy URL when ready
-        val url by remember(proxyBaseUrl, initialUrl, isProxyReady) {
+        val url by remember(proxyBaseUrl, proxyPathname, isProxyReady) {
             mutableStateOf(
                 if (proxyBaseUrl.isNotEmpty() && isProxyReady) {
-                    // Simply prepend the proxy URL to the target URL
-                    val result = "$proxyBaseUrl/$initialUrl"
+                    // Normalize URL construction to handle different slash combinations
+                    val normalizedBaseUrl = proxyBaseUrl.removeSuffix("/")
+                    val normalizedPathname = proxyPathname.removeSuffix("/").removePrefix("/")
+                    val result = "$normalizedBaseUrl/$normalizedPathname"
                     println("Loading URL: $result")
                     result
                 } else {
@@ -122,17 +125,16 @@ fun App() {
             val processedUrls = remember { mutableSetOf<String>() }
             val client = remember {
                 object : AccompanistWebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean {
+                    override fun shouldOverrideUrlLoading(
+                        view: android.webkit.WebView?,
+                        url: String?
+                    ): Boolean {
                         if (url == null) return false
 
-                        // If the URL isn't already going through our proxy, redirect it
+                        // Allow direct navigation for URLs outside our proxy base URL
                         if (!url.startsWith(proxyBaseUrl)) {
-                            // Simply prepend the proxy URL
-                            val proxiedUrl = "$proxyBaseUrl/$url"
-                            
-                            println("Intercepted navigation to: $url - redirecting through proxy: $proxiedUrl")
-                            webViewNavigator.loadUrl(proxiedUrl)
-                            return true
+                            println("Allowing direct navigation to external URL: $url")
+                            return false // Let the WebView handle it directly
                         }
 
                         return super.shouldOverrideUrlLoading(view, url)
@@ -215,6 +217,10 @@ function getBGColor(el) {
                     println("WebView created")
                     webView.settings.apply {
                         javaScriptEnabled = true
+                        setSupportZoom(false)
+                        domStorageEnabled = true // Enable localStorage
+                        databaseEnabled = true // Required for indexedDB
+                        javaScriptCanOpenWindowsAutomatically = true
                     }
 
                     println("WebView configured with proxy URL: $proxyBaseUrl")

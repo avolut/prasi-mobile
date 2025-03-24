@@ -2,7 +2,10 @@ package com.prasi.mobile.proxy
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.Cache
@@ -20,10 +23,15 @@ import okio.Buffer
 import java.io.File
 import java.util.concurrent.TimeUnit
 
-class ProxyServer(private val context: Context) {
+class ProxyServer(
+    private val context: Context, 
+    private var baseUrl: String,
+    private var basePathSegment: String
+) {
     private val tag = "ProxyServer"
     private val cacheDir = File(context.cacheDir, "proxy_cache")
     private val cacheSize = 50L * 1024L * 1024L // 50 MB cache
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val cachingFileTypes = setOf(
         ".js", ".css", ".html", ".htm",
@@ -35,31 +43,42 @@ class ProxyServer(private val context: Context) {
     private val dispatcher: Dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse {
             val urlPath = request.path ?: return MockResponse().setResponseCode(400).setBody("Missing path")
-            
-            try {
-                // Extract the full URL from the request path
-                // The path should contain the full URL after the first slash
-                val fullUrl = if (urlPath.startsWith("/http")) {
-                    // Handle URLs that start with http
-                    urlPath.substring(1) // Remove leading slash
-                } else if (urlPath.contains("://")) {
-                    // Handle URL that somehow contains the protocol but not at the start
-                    urlPath.substring(urlPath.indexOf("://") - 4) // Assuming http or https (4 or 5 chars)
-                } else {
-                    // Fallback to GitHub if path doesn't contain a URL
-                    "https://github.com" + urlPath
-                }
-                
-                Log.d(tag, "Proxying request to: $fullUrl")
 
-                // Check if we should try to use cache based on file type
+            try {
+                val fullUrl = if (urlPath.startsWith("/http")) {
+                    urlPath.substring(1)
+                } else if (urlPath.contains("://")) {
+                    urlPath.substring(urlPath.indexOf("://") - 4)
+                } else {
+                    val normalizedPath = if (urlPath.startsWith("/") && baseUrl.endsWith("/")) {
+                        urlPath.substring(1)
+                    } else if (!urlPath.startsWith("/") && !baseUrl.endsWith("/")) {
+                        "/$urlPath"
+                    } else {
+                        urlPath
+                    }
+
+                    val finalUrl = if (normalizedPath.contains(basePathSegment)) {
+                        val pathParts = normalizedPath.split(basePathSegment)
+                        if (pathParts.size > 1) {
+                            val basePart = baseUrl.substringBeforeLast(basePathSegment, baseUrl)
+                            "$basePart$basePathSegment${pathParts.last()}"
+                        } else {
+                            baseUrl + normalizedPath
+                        }
+                    } else {
+                        baseUrl + normalizedPath
+                    }
+
+                    Log.d(tag, "Proxying request to: $finalUrl from path: $urlPath")
+                    finalUrl
+                }
+
                 val shouldCache = cachingFileTypes.any { fullUrl.endsWith(it, ignoreCase = true) }
 
-                // Copy headers from the original request
                 val requestBuilder = Request.Builder()
                     .url(fullUrl)
-                
-                // Copy all original headers except Host (which needs to match the target server)
+
                 val headers = request.headers
                 for (i in 0 until headers.size) {
                     val name = headers.name(i)
@@ -96,6 +115,8 @@ class ProxyServer(private val context: Context) {
                             val cachedResponse = executeRequestAsync(cachedRequest)
                             if (cachedResponse.code != 504) {
                                 Log.d(tag, "Cache hit for: $fullUrl")
+                                // Even though we got a cache hit, still update the cache in the background
+                                refreshCacheAsync(fullUrl, networkRequest)
                                 return@runBlocking createMockResponse(cachedResponse)
                             }
                             Log.d(tag, "Cache miss for: $fullUrl")
@@ -204,6 +225,30 @@ class ProxyServer(private val context: Context) {
                 }
             }
         }
+
+        private fun refreshCacheAsync(url: String, request: Request) {
+            // Use a non-blocking approach to update the cache in the background
+            coroutineScope.launch {
+                try {
+                    // Create a new request that will ignore cache and force network
+                    val networkRequest = request.newBuilder()
+                        .cacheControl(CacheControl.FORCE_NETWORK)
+                        .build()
+                    
+                    val response = client.newCall(networkRequest).execute()
+                    if (response.isSuccessful) {
+                        Log.d(tag, "Successfully refreshed cache for: $url")
+                    } else {
+                        Log.d(tag, "Cache refresh failed for: $url with code: ${response.code}")
+                    }
+                    // Close the response to ensure resources are released
+                    response.close()
+                } catch (e: Exception) {
+                    // Just log the error but don't do anything else since this is a background refresh
+                    Log.e(tag, "Error refreshing cache for $url: ${e.message}")
+                }
+            }
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -217,6 +262,7 @@ class ProxyServer(private val context: Context) {
             // Force cache all responses for 1 day
             originalResponse.newBuilder()
                 .header("Cache-Control", "public, max-age=86400")
+                .removeHeader("Pragma") // Remove potential no-cache directives
                 .build()
         }
         .build()
@@ -239,5 +285,13 @@ class ProxyServer(private val context: Context) {
 
     fun getProxyUrl(): String {
         return "http://${server.hostName}:${server.port}"
+    }
+
+    fun setBaseUrl(url: String) {
+        baseUrl = if (url.endsWith("/")) url else "$url/"
+    }
+    
+    fun setBasePathSegment(path: String) {
+        basePathSegment = path
     }
 }
