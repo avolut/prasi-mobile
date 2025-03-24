@@ -103,6 +103,18 @@ export async function applyChanges(changes: RenameChanges): Promise<void> {
       if (change.type === "move") {
         // Create target directory structure
         const dir = change.newPath.substring(0, change.newPath.lastIndexOf("/"));
+        await new Promise<void>((resolve, reject) => {
+          Bun.spawn(["mkdir", "-p", dir], {
+            stdout: "inherit",
+            stderr: "inherit",
+          }).exited.then((code) => {
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(new Error(`Failed to create directory ${dir}`));
+            }
+          });
+        });
         await Bun.write(Bun.file(`${dir}/.gitkeep`), "");
 
         // Move files from old to new location
