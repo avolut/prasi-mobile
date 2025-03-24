@@ -22,22 +22,67 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
+import com.prasi.mobile.proxy.ProxyServer
 import com.prasi.mobile.web.AccompanistWebViewClient
 import com.prasi.mobile.web.WebView
 import com.prasi.mobile.web.rememberWebViewNavigator
 import com.prasi.mobile.web.rememberWebViewState
-
+import kotlin.concurrent.thread
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun App() {
     MaterialTheme {
-        val url by remember { mutableStateOf("https://github.com/") }
+        val context = LocalContext.current
+        val proxyServer = remember(context) { ProxyServer(context) }
+        var proxyBaseUrl by remember { mutableStateOf("") }
+        val initialUrl by remember { mutableStateOf("https://github.com/") }
+        var isProxyReady by remember { mutableStateOf(false) }
+
+        // Initialize proxy server in background thread
+        DisposableEffect(Unit) {
+            thread {
+                try {
+                    proxyServer.start()
+                    // Update UI on main thread
+                    (context as? Activity)?.runOnUiThread {
+                        proxyBaseUrl = proxyServer.getProxyUrl()
+                        isProxyReady = true
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            onDispose {
+                thread {
+                    try {
+                        proxyServer.stop()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+
+        // Use proxy URL when ready
+        val url by remember(proxyBaseUrl, initialUrl, isProxyReady) {
+            mutableStateOf(
+                if (proxyBaseUrl.isNotEmpty() && isProxyReady) {
+                    // Simply prepend the proxy URL to the target URL
+                    val result = "$proxyBaseUrl/$initialUrl"
+                    println("Loading URL: $result")
+                    result
+                } else {
+                    "about:blank" // Show blank until proxy is ready
+                }
+            )
+        }
+
         val webViewState = rememberWebViewState(url)
         val webViewNavigator = rememberWebViewNavigator()
         var statusBarColor by remember { mutableStateOf(Color.Black) }
         var statusBarDarkIcons by remember { mutableStateOf(true) }
-        val context = LocalContext.current
 
         DisposableEffect(statusBarColor, statusBarDarkIcons) {
             val window = (context as Activity).window
@@ -77,6 +122,22 @@ fun App() {
             val processedUrls = remember { mutableSetOf<String>() }
             val client = remember {
                 object : AccompanistWebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean {
+                        if (url == null) return false
+
+                        // If the URL isn't already going through our proxy, redirect it
+                        if (!url.startsWith(proxyBaseUrl)) {
+                            // Simply prepend the proxy URL
+                            val proxiedUrl = "$proxyBaseUrl/$url"
+                            
+                            println("Intercepted navigation to: $url - redirecting through proxy: $proxiedUrl")
+                            webViewNavigator.loadUrl(proxiedUrl)
+                            return true
+                        }
+
+                        return super.shouldOverrideUrlLoading(view, url)
+                    }
+
                     override fun onPageFinished(view: android.webkit.WebView, url: String?) {
                         super.onPageFinished(view, url)
                         if (url != null && processedUrls.add(url)) {
@@ -150,9 +211,13 @@ function getBGColor(el) {
                 navigator = webViewNavigator,
                 modifier = Modifier.fillMaxSize(),
                 client = client,
-                onCreated = {
+                onCreated = { webView ->
                     println("WebView created")
-                    it.settings.javaScriptEnabled = true
+                    webView.settings.apply {
+                        javaScriptEnabled = true
+                    }
+
+                    println("WebView configured with proxy URL: $proxyBaseUrl")
                 }
             )
         }

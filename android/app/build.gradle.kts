@@ -58,6 +58,11 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
 
+    // OkHttp
+    implementation(libs.okhttp)
+    implementation(libs.mockwebserver)
+    implementation(libs.okio)
+
     // Compose
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
@@ -72,6 +77,10 @@ dependencies {
     // WebView
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.5.1")
+    
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
