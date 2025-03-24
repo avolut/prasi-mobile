@@ -1,4 +1,4 @@
-import { readdir } from "node:fs/promises";
+import { readdir, mkdir, readFile, writeFile } from "node:fs/promises";
 import type { FileChange, DirectoryChange, RenameChanges } from "./types";
 
 /**
@@ -17,7 +17,7 @@ export async function generateChanges(
 
   // Handle build.gradle.kts changes
   const buildGradlePath = "android/app/build.gradle.kts";
-  const buildGradleContent = await Bun.file(buildGradlePath).text();
+  const buildGradleContent = await readFile(buildGradlePath, 'utf-8');
   const newBuildGradleContent = buildGradleContent
     .replace(`namespace = "${oldPackage}"`, `namespace = "${newPackage}"`)
     .replace(`applicationId = "${oldPackage}"`, `applicationId = "${newPackage}"`);
@@ -30,7 +30,7 @@ export async function generateChanges(
 
   // Handle AndroidManifest.xml changes
   const manifestPath = "android/app/src/main/AndroidManifest.xml";
-  const manifestContent = await Bun.file(manifestPath).text();
+  const manifestContent = await readFile(manifestPath, 'utf-8');
   const newManifestContent = manifestContent.replace(
     `android:name="${oldPackage}`,
     `android:name="${newPackage}`
@@ -44,7 +44,7 @@ export async function generateChanges(
 
   // Handle strings.xml changes
   const stringsPath = "android/app/src/main/res/values/strings.xml";
-  const stringsContent = await Bun.file(stringsPath).text();
+  const stringsContent = await readFile(stringsPath, 'utf-8');
   const newStringsContent = stringsContent.replace(
     `<string name="app_name">${oldAppName}</string>`,
     `<string name="app_name">${newAppName}</string>`
@@ -58,7 +58,7 @@ export async function generateChanges(
 
   // Handle settings.gradle.kts changes
   const settingsPath = "android/settings.gradle.kts";
-  const settingsContent = await Bun.file(settingsPath).text();
+  const settingsContent = await readFile(settingsPath, 'utf-8');
   const newSettingsContent = settingsContent.replace(
     `rootProject.name = "${oldAppName}"`,
     `rootProject.name = "${newAppName}"`
@@ -90,7 +90,7 @@ export async function applyChanges(changes: RenameChanges): Promise<void> {
   // First apply file changes
   for (const change of changes.fileChanges) {
     try {
-      await Bun.write(Bun.file(change.path), change.newContent);
+      await writeFile(change.path, change.newContent, 'utf-8');
     } catch (err) {
       const error = err as Error;
       throw new Error(`Failed to modify file ${change.path}: ${error.message}`);
@@ -103,26 +103,15 @@ export async function applyChanges(changes: RenameChanges): Promise<void> {
       if (change.type === "move") {
         // Create target directory structure
         const dir = change.newPath.substring(0, change.newPath.lastIndexOf("/"));
-        await new Promise<void>((resolve, reject) => {
-          Bun.spawn(["mkdir", "-p", dir], {
-            stdout: "inherit",
-            stderr: "inherit",
-          }).exited.then((code) => {
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(new Error(`Failed to create directory ${dir}`));
-            }
-          });
-        });
-        await Bun.write(Bun.file(`${dir}/.gitkeep`), "");
+        await mkdir(dir, { recursive: true });
+        await writeFile(`${dir}/.gitkeep`, "");
 
         // Move files from old to new location
         const files = await readdir(change.oldPath);
         for (const file of files) {
           if (file === ".gitkeep") continue;
-          const content = await Bun.file(`${change.oldPath}/${file}`).text();
-          await Bun.write(Bun.file(`${change.newPath}/${file}`), content);
+          const content = await readFile(`${change.oldPath}/${file}`, 'utf-8');
+          await writeFile(`${change.newPath}/${file}`, content, 'utf-8');
         }
       }
     } catch (err) {
@@ -141,7 +130,7 @@ export async function verifyChanges(changes: RenameChanges): Promise<boolean> {
   // Verify file changes
   for (const change of changes.fileChanges) {
     try {
-      const content = await Bun.file(change.path).text();
+      const content = await readFile(change.path, 'utf-8');
       if (content !== change.newContent) {
         return false;
       }
@@ -154,8 +143,9 @@ export async function verifyChanges(changes: RenameChanges): Promise<boolean> {
   for (const change of changes.directoryChanges) {
     try {
       if (change.type === "move") {
-        const exists = await Bun.file(change.newPath).exists();
-        if (!exists) {
+        try {
+          await readdir(change.newPath);
+        } catch {
           return false;
         }
       }
