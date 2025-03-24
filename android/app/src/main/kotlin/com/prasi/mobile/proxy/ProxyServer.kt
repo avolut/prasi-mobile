@@ -21,7 +21,13 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import okio.Buffer
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+
+// Interface for cache update notifications
+interface CacheUpdateListener {
+    fun onCacheUpdated(url: String)
+}
 
 class ProxyServer(
     private val context: Context, 
@@ -32,6 +38,10 @@ class ProxyServer(
     private val cacheDir = File(context.cacheDir, "proxy_cache")
     private val cacheSize = 50L * 1024L * 1024L // 50 MB cache
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cacheUpdateListeners = ConcurrentHashMap<String, MutableList<CacheUpdateListener>>()
+
+    // Keep track of currently refreshing URLs to avoid duplicate refreshes
+    private val refreshingUrls = ConcurrentHashMap.newKeySet<String>()
 
     private val cachingFileTypes = setOf(
         ".js", ".css", ".html", ".htm",
@@ -137,12 +147,28 @@ class ProxyServer(
                     } else {
                         Log.d(tag, "Direct request for: $fullUrl")
                         try {
+                            // For all direct requests, also update the cache
+                            refreshCacheAsync(fullUrl, networkRequest)
                             proxyRequestAsync(fullUrl, networkRequest)
                         } catch (e: Exception) {
                             Log.e(tag, "Network error for $fullUrl: ${e.message}")
+                            // Try to get from cache even for non-cacheable files when offline
+                            try {
+                                val cachedRequest = networkRequest.newBuilder()
+                                    .cacheControl(CacheControl.FORCE_CACHE)
+                                    .build()
+                                val cachedResponse = executeRequestAsync(cachedRequest)
+                                if (cachedResponse.code != 504) {
+                                    Log.d(tag, "Offline - using cached version for: $fullUrl")
+                                    return@runBlocking createMockResponse(cachedResponse)
+                                }
+                            } catch (innerException: Exception) {
+                                Log.d(tag, "No cache available for offline request: $fullUrl")
+                            }
+                            
                             MockResponse()
                                 .setResponseCode(503)
-                                .setBody("Offline: This content requires network connection.")
+                                .setBody("Offline: Content not available in cache.")
                         }
                     }
                 }
@@ -157,8 +183,18 @@ class ProxyServer(
         private suspend fun proxyRequestAsync(url: String, request: Request): MockResponse {
             return withContext(Dispatchers.IO) {
                 try {
-                    executeRequestAsync(request).use { response ->
+                    // Force network request to bypass cache
+                    val networkRequest = request.newBuilder()
+                        .cacheControl(CacheControl.FORCE_NETWORK)
+                        .build()
+                    
+                    executeRequestAsync(networkRequest).use { response ->
                         Log.d(tag, "Response for $url: ${response.code}")
+                        // If this is a successful response, store it in cache explicitly
+                        if (response.isSuccessful) {
+                            // Notify listeners about the update
+                            notifyCacheListeners(url)
+                        }
                         createMockResponse(response)
                     }
                 } catch (e: Exception) {
@@ -207,6 +243,11 @@ class ProxyServer(
                     addHeader(name, value)
                 }
 
+                // Add headers to disable browser caching
+                addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                addHeader("Pragma", "no-cache")
+                addHeader("Expires", "0")
+
                 response.body?.let { responseBody ->
                     try {
                         // Create a buffer to hold the body
@@ -226,27 +267,10 @@ class ProxyServer(
             }
         }
 
-        private fun refreshCacheAsync(url: String, request: Request) {
-            // Use a non-blocking approach to update the cache in the background
-            coroutineScope.launch {
-                try {
-                    // Create a new request that will ignore cache and force network
-                    val networkRequest = request.newBuilder()
-                        .cacheControl(CacheControl.FORCE_NETWORK)
-                        .build()
-                    
-                    val response = client.newCall(networkRequest).execute()
-                    if (response.isSuccessful) {
-                        Log.d(tag, "Successfully refreshed cache for: $url")
-                    } else {
-                        Log.d(tag, "Cache refresh failed for: $url with code: ${response.code}")
-                    }
-                    // Close the response to ensure resources are released
-                    response.close()
-                } catch (e: Exception) {
-                    // Just log the error but don't do anything else since this is a background refresh
-                    Log.e(tag, "Error refreshing cache for $url: ${e.message}")
-                }
+        private fun notifyCacheListeners(url: String) {
+            Log.d(tag, "Notifying cache update for: $url")
+            cacheUpdateListeners[url]?.forEach { listener ->
+                listener.onCacheUpdated(url)
             }
         }
     }
@@ -259,31 +283,170 @@ class ProxyServer(
         // Add a network interceptor that forces caching even when headers say not to
         .addNetworkInterceptor { chain ->
             val originalResponse = chain.proceed(chain.request())
-            // Force cache all responses for 1 day
-            originalResponse.newBuilder()
-                .header("Cache-Control", "public, max-age=86400")
-                .removeHeader("Pragma") // Remove potential no-cache directives
-                .build()
+            val url = originalResponse.request.url.toString()
+            val shouldCache = cachingFileTypes.any { url.endsWith(it, ignoreCase = true) }
+            
+            if (shouldCache) {
+                // Force cache for cacheable file types, but with a shorter max-age
+                // to encourage more frequent updates
+                Log.d(tag, "Forcing cache for: $url")
+                originalResponse.newBuilder()
+                    .header("Cache-Control", "public, max-age=300") // 5 minutes
+                    .removeHeader("Pragma") // Remove potential no-cache directives
+                    .build()
+            } else {
+                // Cache all responses for a short period to help with offline access
+                Log.d(tag, "Adding minimal cache for: $url")
+                originalResponse.newBuilder()
+                    .header("Cache-Control", "public, max-age=60") // 1 minute
+                    .removeHeader("Pragma") 
+                    .build()
+            }
         }
         .build()
 
     private val server = MockWebServer()
+    private var isServerRunning = false
+
+    private fun refreshCacheAsync(url: String, request: Request) {
+        // Skip if we're already refreshing this URL
+        if (!refreshingUrls.add(url)) {
+            Log.d(tag, "Already refreshing cache for: $url")
+            return
+        }
+
+        // Use a non-blocking approach to update the cache in the background
+        coroutineScope.launch {
+            try {
+                // First get the cached response to compare with network version later
+                val cachedRequest = request.newBuilder()
+                    .cacheControl(CacheControl.FORCE_CACHE)
+                    .build()
+                
+                var cachedETag: String? = null
+                var cachedLastModified: String? = null
+                var cachedContent: ByteArray? = null
+                
+                try {
+                    client.newCall(cachedRequest).execute().use { cachedResponse ->
+                        // Extract ETag and Last-Modified for comparison
+                        cachedETag = cachedResponse.header("ETag")
+                        cachedLastModified = cachedResponse.header("Last-Modified")
+                        
+                        // Store content for byte-by-byte comparison if needed
+                        cachedResponse.body?.let { body ->
+                            cachedContent = body.bytes()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(tag, "No existing cache for comparison: $url")
+                    // Continue with network request even if cache read fails
+                }
+                
+                // Create a new request that will ignore cache and force network
+                val networkRequest = request.newBuilder()
+                    .cacheControl(CacheControl.FORCE_NETWORK)
+                    .header("Cache-Control", "no-cache")
+                    .build()
+                
+                val response = client.newCall(networkRequest).execute()
+                if (response.isSuccessful) {
+                    val networkETag = response.header("ETag")
+                    val networkLastModified = response.header("Last-Modified")
+                    
+                    // Get network content for comparison
+                    var contentChanged = false
+                    val networkContent = response.body?.bytes()
+                    
+                    // Compare content directly if we have both cached and network content
+                    if (cachedContent != null && networkContent != null) {
+                        contentChanged = !cachedContent.contentEquals(networkContent)
+                        Log.d(tag, "Content comparison for $url: changed=$contentChanged")
+                    } else {
+                        // Fall back to header-based detection
+                        contentChanged = (cachedETag != null && networkETag != null && cachedETag != networkETag) ||
+                                      (cachedLastModified != null && networkLastModified != null && 
+                                       cachedLastModified != networkLastModified)
+                    }
+                    
+                    Log.d(tag, "Successfully refreshed cache for: $url, content changed: $contentChanged")
+                    
+                    if (contentChanged) {
+                        // Ensure the updated content is properly stored in cache
+                        // by making a request that writes to the cache
+                        val cacheUpdateRequest = Request.Builder()
+                            .url(url)
+                            .cacheControl(CacheControl.Builder()
+                                .maxAge(5, TimeUnit.MINUTES)
+                                .build())
+                            .build()
+                        
+                        // Execute and close this request - it's just to update the cache
+                        client.newCall(cacheUpdateRequest).execute().close()
+                        
+                        // Notify listeners that content has been updated
+                        val listeners = cacheUpdateListeners[url]
+                        listeners?.forEach { listener ->
+                            listener.onCacheUpdated(url)
+                        }
+                    }
+                } else {
+                    Log.d(tag, "Cache refresh failed for: $url with code: ${response.code}")
+                }
+                // Close the response to ensure resources are released
+                response.close()
+            } catch (e: Exception) {
+                // Just log the error but don't do anything else since this is a background refresh
+                Log.e(tag, "Error refreshing cache for $url: ${e.message}")
+            } finally {
+                // Mark this URL as no longer being refreshed
+                refreshingUrls.remove(url)
+            }
+        }
+    }
 
     fun start() {
+        if (isServerRunning) {
+            Log.i(tag, "Proxy server already running at ${getProxyUrl()}")
+            return
+        }
+        
         if (!cacheDir.exists()) {
             cacheDir.mkdirs()
         }
         server.dispatcher = dispatcher
-        server.start()
-        Log.i(tag, "Proxy server started at ${getProxyUrl()}")
+        coroutineScope.launch {
+            try {
+                server.start()
+                isServerRunning = true
+                Log.i(tag, "Proxy server started at ${getProxyUrl()}")
+            } catch (e: Exception) {
+                Log.e(tag, "Error starting server: ${e.message}")
+            }
+        }
     }
 
     fun stop() {
-        server.shutdown()
-        Log.i(tag, "Proxy server stopped")
+        if (!isServerRunning) {
+            Log.i(tag, "Proxy server already stopped")
+            return
+        }
+        
+        coroutineScope.launch {
+            try {
+                server.shutdown()
+                isServerRunning = false
+                Log.i(tag, "Proxy server stopped")
+            } catch (e: Exception) {
+                Log.e(tag, "Error stopping server: ${e.message}")
+            }
+        }
     }
 
     fun getProxyUrl(): String {
+        if (!isServerRunning) {
+            return ""
+        }
         return "http://${server.hostName}:${server.port}"
     }
 
@@ -293,5 +456,69 @@ class ProxyServer(
     
     fun setBasePathSegment(path: String) {
         basePathSegment = path
+    }
+    
+    /**
+     * Register a listener to be notified when a specific URL's cache is updated
+     * @param url The URL to monitor for updates
+     * @param listener The listener to be called when the cache is updated
+     */
+    fun registerCacheUpdateListener(url: String, listener: CacheUpdateListener) {
+        cacheUpdateListeners.getOrPut(url) { mutableListOf() }.add(listener)
+    }
+    
+    /**
+     * Unregister a cache update listener for a specific URL
+     * @param url The URL to stop monitoring
+     * @param listener The listener to remove
+     */
+    fun unregisterCacheUpdateListener(url: String, listener: CacheUpdateListener) {
+        cacheUpdateListeners[url]?.remove(listener)
+        if (cacheUpdateListeners[url]?.isEmpty() == true) {
+            cacheUpdateListeners.remove(url)
+        }
+    }
+    
+    /**
+     * Clears all cached responses
+     * Call this when you need to force a complete refresh of all content
+     */
+    fun clearCache() {
+        coroutineScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    // Delete the cache directory
+                    if (cacheDir.exists()) {
+                        val files = cacheDir.listFiles()
+                        files?.forEach { file ->
+                            file.delete()
+                        }
+                        Log.d(tag, "Cache cleared successfully")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Error clearing cache: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Force refresh the cache for a specific URL
+     * @param url The URL to refresh
+     */
+    fun forceCacheRefresh(url: String) {
+        coroutineScope.launch {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .cacheControl(CacheControl.FORCE_NETWORK)
+                    .build()
+                
+                Log.d(tag, "Forcing cache refresh for: $url")
+                this@ProxyServer.refreshCacheAsync(url, request)
+            } catch (e: Exception) {
+                Log.e(tag, "Error forcing cache refresh: ${e.message}")
+            }
+        }
     }
 }
