@@ -1,0 +1,15 @@
+{
+  "name": "prasi-mobile",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "scripts": {
+    "android": "bun run --silent system/android.ts"
+  },
+  "peerDependencies": {
+    "typescript": "^5.8.2"
+  }
+}
