@@ -7,7 +7,8 @@
     "@types/bun": "latest"
   },
   "scripts": {
-    "android": "bun run --silent system/android.ts"
+    "android": "bun run --silent system/android/android.ts",
+    "ios": "bun run --silent system/ios/ios.ts"
   },
   "peerDependencies": {
     "typescript": "^5.8.2"
