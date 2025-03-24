@@ -150,6 +150,7 @@ async function main() {
     console.log("\nAll changes applied successfully!");
     console.log(`App renamed from ${currentConfig.appName} to ${newConfig.appName}`);
     console.log(`Package renamed from ${currentConfig.packageName} to ${newConfig.packageName}`);
+    process.exit(0);
 
   } catch (err) {
     const error = err as Error;

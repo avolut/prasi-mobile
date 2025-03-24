@@ -106,13 +106,27 @@ export async function applyChanges(changes: RenameChanges): Promise<void> {
         await mkdir(dir, { recursive: true });
         await writeFile(`${dir}/.gitkeep`, "");
 
-        // Move files from old to new location
-        const files = await readdir(change.oldPath);
-        for (const file of files) {
-          if (file === ".gitkeep") continue;
-          const content = await readFile(`${change.oldPath}/${file}`, 'utf-8');
-          await writeFile(`${change.newPath}/${file}`, content, 'utf-8');
-        }
+        // Recursive function to copy directory contents
+        const copyDir = async (src: string, dest: string) => {
+          const entries = await readdir(src, { withFileTypes: true });
+          
+          for (const entry of entries) {
+            const srcPath = `${src}/${entry.name}`;
+            const destPath = `${dest}/${entry.name}`;
+            
+            if (entry.isDirectory()) {
+              await mkdir(destPath, { recursive: true });
+              await copyDir(srcPath, destPath);
+            } else if (entry.isFile() && entry.name !== '.gitkeep') {
+              const content = await readFile(srcPath, 'utf-8');
+              await writeFile(destPath, content, 'utf-8');
+            }
+          }
+        };
+
+        // Move files and directories from old to new location
+        await mkdir(change.newPath, { recursive: true });
+        await copyDir(change.oldPath, change.newPath);
       }
     } catch (err) {
       const error = err as Error;
@@ -143,9 +157,39 @@ export async function verifyChanges(changes: RenameChanges): Promise<boolean> {
   for (const change of changes.directoryChanges) {
     try {
       if (change.type === "move") {
-        try {
-          await readdir(change.newPath);
-        } catch {
+        // Recursive function to compare directories
+        const compareDirectories = async (src: string, dest: string): Promise<boolean> => {
+          try {
+            const srcEntries = await readdir(src, { withFileTypes: true });
+            const destEntries = await readdir(dest, { withFileTypes: true });
+
+            // Check if all source files exist in destination
+            for (const srcEntry of srcEntries) {
+              if (srcEntry.name === '.gitkeep') continue;
+              
+              const destEntry = destEntries.find(e => e.name === srcEntry.name);
+              if (!destEntry) return false;
+
+              const srcPath = `${src}/${srcEntry.name}`;
+              const destPath = `${dest}/${srcEntry.name}`;
+
+              if (srcEntry.isDirectory()) {
+                if (!destEntry.isDirectory()) return false;
+                if (!await compareDirectories(srcPath, destPath)) return false;
+              } else if (srcEntry.isFile()) {
+                if (!destEntry.isFile()) return false;
+                const srcContent = await readFile(srcPath, 'utf-8');
+                const destContent = await readFile(destPath, 'utf-8');
+                if (srcContent !== destContent) return false;
+              }
+            }
+            return true;
+          } catch {
+            return false;
+          }
+        };
+
+        if (!await compareDirectories(change.oldPath, change.newPath)) {
           return false;
         }
       }
